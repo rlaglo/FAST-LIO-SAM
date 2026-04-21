@@ -1,0 +1,28 @@
+<launch>
+
+    <arg name="rviz" default="true" />
+	<arg name="odom_topic" default="/aft_mapped_to_init" />
+	<arg name="lidar_topic" default="/laser_cloud_registered" />
+	<!-- <arg name="odom_topic" default="/keyframe_pose" />
+	<arg name="lidar_topic" default="/keyframe_pcd" /> -->
+
+
+
+    <node if="$(arg rviz)" pkg="rviz" type="rviz" name="rviz_sam"
+          args="-d $(find fast_lio_sam)/config/sam_rviz.rviz" launch-prefix="nice"/>
+
+    <rosparam command="load" file="$(find fast_lio_sam)/config/config.yaml" />
+
+    <node pkg="fast_lio_sam" type="fast_lio_sam_node" name="fast_lio_sam_node" output="screen">
+        <env name="LD_LIBRARY_PATH" value="/usr/local/lib:$(optenv LD_LIBRARY_PATH)"/>
+        <remap from="/Odometry" to="$(arg odom_topic)"/>
+        <remap from="/cloud_registered" to="$(arg lidar_topic)"/>
+    </node>
+
+    <!-- <node pkg="rosbag" 
+    type="play" 
+    name="player" 
+    args="/home/dataset/data4.bag"
+    required="true" /> -->
+
+</launch>

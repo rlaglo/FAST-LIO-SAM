@@ -5,6 +5,7 @@
 #include <ctime>
 #include <cmath>
 #include <chrono> //time check
+#include <cstddef>
 #include <vector>
 #include <memory>
 #include <deque>
@@ -89,6 +90,20 @@ private:
     bool global_map_vis_switch_ = true;
     ///// results
     bool save_map_bag_ = false, save_map_pcd_ = false, save_in_kitti_format_ = false;
+    bool save_mapped_txt_ = true;
+    bool match_mapped_txt_baseline_length_ = false;
+    int save_max_points_ = 9000000;
+    std::string mapped_txt_path_;
+    std::string mapped_txt_baseline_path_;
+    std::mutex mapped_txt_mutex_;
+    bool shutdown_saved_ = false;
+    std::mutex shutdown_save_mutex_;
+    bool auto_save_on_idle_ = true;
+    double bag_end_timeout_sec_ = 30.0;
+    bool idle_input_started_ = false;
+    bool idle_shutdown_triggered_ = false;
+    ros::Time last_input_time_;
+    std::mutex idle_mutex_;
     ///// ros
     ros::NodeHandle nh_;
     ros::Publisher corrected_odom_pub_, corrected_path_pub_, odom_pub_, path_pub_;
@@ -107,8 +122,12 @@ private:
 public:
     explicit FastLioSam(const ros::NodeHandle &n_private);
     ~FastLioSam();
+    void shutdownAndSave();
+    bool shouldShutdownForIdle();
 
 private:
+    pcl::PointCloud<PointType>::Ptr capPointCount(const pcl::PointCloud<PointType>::Ptr &cloud) const;
+    void appendMappedTumPose(double timestamp, const Eigen::Matrix4d &pose_eig);
     // methods
     void updateOdomsAndPaths(const PosePcd &pose_pcd_in);
     bool checkIfKeyframe(const PosePcd &pose_pcd_in, const PosePcd &latest_pose_pcd);

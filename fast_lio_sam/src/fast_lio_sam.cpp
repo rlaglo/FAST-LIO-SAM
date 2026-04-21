@@ -12,7 +12,9 @@ FastLioSam::FastLioSam(const ros::NodeHandle &n_private):
     nh_.param<double>("/basic/vis_hz", vis_hz, 0.5);
     /* keyframe */
     nh_.param<double>("/keyframe/keyframe_threshold", keyframe_thr_, 1.0);
-    nh_.param<int>("/keyframe/nusubmap_keyframes", lc_config.num_submap_keyframes_, 5);
+    nh_.param<int>("/keyframe/num_submap_keyframes", lc_config.num_submap_keyframes_, 5);
+    // Backward compatibility for older config typo key.
+    nh_.param<int>("/keyframe/nusubmap_keyframes", lc_config.num_submap_keyframes_, lc_config.num_submap_keyframes_);
     /* loop */
     nh_.param<double>("/loop/loop_detection_radius", lc_config.loop_detection_radius_, 15.0);
     nh_.param<double>("/loop/loop_detection_timediff_threshold", lc_config.loop_detection_timediff_threshold_, 10.0);
@@ -25,6 +27,9 @@ FastLioSam::FastLioSam(const ros::NodeHandle &n_private):
     nh_.param<bool>("/result/save_map_pcd", save_map_pcd_, false);
     nh_.param<bool>("/result/save_map_bag", save_map_bag_, false);
     nh_.param<bool>("/result/save_in_kitti_format", save_in_kitti_format_, false);
+    nh_.param<int>("/result/save_max_points", save_max_points_, 9000000);
+    nh_.param<bool>("/result/auto_save_on_idle", auto_save_on_idle_, true);
+    nh_.param<double>("/result/bag_end_timeout_sec", bag_end_timeout_sec_, 30.0);
     nh_.param<std::string>("/result/seq_name", seq_name_, "");
     /* Loop closure */
     loop_closure_.reset(new LoopClosure(lc_config));
@@ -36,7 +41,32 @@ FastLioSam::FastLioSam(const ros::NodeHandle &n_private):
     /* ROS things */
     odom_path_.header.frame_id = map_frame_;
     corrected_path_.header.frame_id = map_frame_;
-    package_path_ = ros::package::getPath("fast_lio_sam_qn");
+    package_path_ = ros::package::getPath("fast_lio_sam");
+    if (package_path_.empty())
+    {
+        package_path_ = fs::current_path().string();
+        ROS_WARN("Package path lookup failed. Falling back to current path: %s", package_path_.c_str());
+    }
+    fs::create_directories(package_path_ + "/result");
+    nh_.param<bool>("/result/save_mapped_txt", save_mapped_txt_, true);
+    nh_.param<std::string>("/result/mapped_txt_path", mapped_txt_path_, std::string(""));
+    nh_.param<bool>("/result/match_mapped_txt_baseline_length", match_mapped_txt_baseline_length_, false);
+    nh_.param<std::string>("/result/mapped_txt_baseline_path", mapped_txt_baseline_path_, std::string(""));
+    if (mapped_txt_path_.empty())
+    {
+        mapped_txt_path_ = package_path_ + "/result/mapped.txt";
+    }
+    if (save_mapped_txt_)
+    {
+        fs::path mapped_txt_parent = fs::path(mapped_txt_path_).parent_path();
+        if (!mapped_txt_parent.empty())
+        {
+            fs::create_directories(mapped_txt_parent);
+        }
+        std::ofstream mapped_txt_file(mapped_txt_path_, std::ios::out);
+        mapped_txt_file.close();
+        ROS_INFO("FAST-LIO-SAM TUM path will be saved to %s", mapped_txt_path_.c_str());
+    }
     /* publishers */
     odom_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/ori_odom", 10, true);
     path_pub_ = nh_.advertise<nav_msgs::Path>("/ori_path", 10, true);
@@ -50,7 +80,8 @@ FastLioSam::FastLioSam(const ros::NodeHandle &n_private):
     debug_dst_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/dst", 10, true);
     debug_fine_aligned_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/aligned", 10, true);
     /* subscribers */
-    sub_odom_ = std::make_shared<message_filters::Subscriber<nav_msgs::Odometry>>(nh_, "/Odometry", 10);
+    // 런치파일에서 /aft_mapped_to_init 로 리매핑 됐음
+    sub_odom_ = std::make_shared<message_filters::Subscriber<nav_msgs::Odometry>>(nh_, "/Odometry", 10); 
     sub_pcd_ = std::make_shared<message_filters::Subscriber<sensor_msgs::PointCloud2>>(nh_, "/cloud_registered", 10);
     sub_odom_pcd_sync_ = std::make_shared<message_filters::Synchronizer<odom_pcd_sync_pol>>(odom_pcd_sync_pol(10), *sub_odom_, *sub_pcd_);
     sub_odom_pcd_sync_->registerCallback(boost::bind(&FastLioSam::odomPcdCallback, this, _1, _2));
@@ -67,6 +98,11 @@ void FastLioSam::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
     Eigen::Matrix4d last_odom_tf;
     last_odom_tf = current_frame_.pose_eig_;                              // to calculate delta
     current_frame_ = PosePcd(*odom_msg, *pcd_msg, current_keyframe_idx_); // to be checked if keyframe or not
+    {
+        std::lock_guard<std::mutex> idle_lock(idle_mutex_);
+        last_input_time_ = ros::Time::now();
+        idle_input_started_ = true;
+    }
     high_resolution_clock::time_point t1 = high_resolution_clock::now();
     {
         //// 1. realtime pose = last corrected odom * delta (last -> current)
@@ -178,10 +214,39 @@ void FastLioSam::odomPcdCallback(const nav_msgs::OdometryConstPtr &odom_msg,
     return;
 }
 
+bool FastLioSam::shouldShutdownForIdle()
+{
+    if (!auto_save_on_idle_)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> idle_lock(idle_mutex_);
+    if (!idle_input_started_ || idle_shutdown_triggered_)
+    {
+        return false;
+    }
+
+    const double idle_sec = (ros::Time::now() - last_input_time_).toSec();
+    if (idle_sec < bag_end_timeout_sec_)
+    {
+        return false;
+    }
+
+    idle_shutdown_triggered_ = true;
+    ROS_WARN("No synchronized odom/pcd input for %.1f sec. Triggering shutdown save.", idle_sec);
+    return true;
+}
+
 void FastLioSam::loopTimerFunc(const ros::TimerEvent &event)
 {
+    (void)event;
+    if (!is_initialized_ || keyframes_.empty())
+    {
+        return;
+    }
     auto &latest_keyframe = keyframes_.back();
-    if (!is_initialized_ || keyframes_.empty() || latest_keyframe.processed_)
+    if (latest_keyframe.processed_)
     {
         return;
     }
@@ -230,6 +295,7 @@ void FastLioSam::loopTimerFunc(const ros::TimerEvent &event)
 
 void FastLioSam::visTimerFunc(const ros::TimerEvent &event)
 {
+    (void)event;
     if (!is_initialized_)
     {
         return;
@@ -357,7 +423,7 @@ void FastLioSam::saveFlagCallback(const std_msgs::String::ConstPtr &msg)
     if (save_map_bag_)
     {
         rosbag::Bag bag;
-        bag.open(package_path_ + "/result.bag", rosbag::bagmode::Write);
+        bag.open(package_path_ + "/result/result.bag", rosbag::bagmode::Write);
         {
             std::lock_guard<std::mutex> lock(keyframes_mutex_);
             for (size_t i = 0; i < keyframes_.size(); ++i)
@@ -384,46 +450,276 @@ void FastLioSam::saveFlagCallback(const std_msgs::String::ConstPtr &msg)
             }
         }
         const auto &voxelized_map = voxelizePcd(corrected_map, voxel_res_);
-        pcl::io::savePCDFileASCII<PointType>(seq_directory + "/" + seq_name_ + "_map.pcd", *voxelized_map);
+        const auto map_to_save = capPointCount(voxelized_map);
+        if (map_to_save->size() < voxelized_map->size())
+        {
+            ROS_WARN("Capped map points before save: %zu -> %zu", voxelized_map->size(), map_to_save->size());
+        }
+        pcl::io::savePCDFileASCII<PointType>(seq_directory + "/" + seq_name_ + "_map.pcd", *map_to_save);
         ROS_INFO("\033[32;1mAccumulated map cloud saved in .pcd format\033[0m");
     }
 }
 
-FastLioSam::~FastLioSam()
+void FastLioSam::shutdownAndSave()
 {
-    // save map
-    if (save_map_bag_)
+    std::lock_guard<std::mutex> shutdown_lock(shutdown_save_mutex_);
+    if (shutdown_saved_)
     {
-        rosbag::Bag bag;
-        bag.open(package_path_ + "/result.bag", rosbag::bagmode::Write);
+        ROS_INFO("shutdownAndSave already executed. Skipping duplicate call.");
+        return;
+    }
+
+    ROS_WARN("shutdownAndSave called. save_map_bag=%d, save_map_pcd=%d", save_map_bag_, save_map_pcd_);
+
+    // Stop incoming callbacks before taking a snapshot for save.
+    loop_timer_.stop();
+    vis_timer_.stop();
+    sub_save_flag_.shutdown();
+    if (sub_odom_pcd_sync_)
+    {
+        sub_odom_pcd_sync_.reset();
+    }
+    if (sub_odom_)
+    {
+        sub_odom_->unsubscribe();
+        sub_odom_.reset();
+    }
+    if (sub_pcd_)
+    {
+        sub_pcd_->unsubscribe();
+        sub_pcd_.reset();
+    }
+
+    std::vector<PosePcd> keyframes_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(keyframes_mutex_);
+        keyframes_snapshot = keyframes_;
+    }
+
+    PosePcd current_frame_snapshot;
+    bool has_current_frame = false;
+    {
+        std::lock_guard<std::mutex> lock(realtime_pose_mutex_);
+        current_frame_snapshot = current_frame_;
+        has_current_frame = !current_frame_snapshot.pcd_.empty();
+    }
+    if (has_current_frame &&
+        (keyframes_snapshot.empty() ||
+         current_frame_snapshot.timestamp_ > keyframes_snapshot.back().timestamp_ + 1e-6))
+    {
+        keyframes_snapshot.push_back(current_frame_snapshot);
+        ROS_WARN("Added latest non-keyframe scan to shutdown snapshot.");
+    }
+
+    if (keyframes_snapshot.empty())
+    {
+        ROS_WARN("No keyframes collected. Skipping shutdown save.");
+        shutdown_saved_ = true;
+        return;
+    }
+
+    ROS_WARN("shutdownAndSave snapshot size: %zu", keyframes_snapshot.size());
+    ROS_WARN("shutdownAndSave output directory: %s/result", package_path_.c_str());
+
+    try
+    {
+        if (save_map_bag_)
         {
-            std::lock_guard<std::mutex> lock(keyframes_mutex_);
-            for (size_t i = 0; i < keyframes_.size(); ++i)
+            rosbag::Bag bag;
+            bag.open(package_path_ + "/result/result.bag", rosbag::bagmode::Write);
+            for (size_t i = 0; i < keyframes_snapshot.size(); ++i)
             {
                 ros::Time time;
-                time.fromSec(keyframes_[i].timestamp_);
-                bag.write("/keyframe_pcd", time, pclToPclRos(keyframes_[i].pcd_, map_frame_));
-                bag.write("/keyframe_pose", time, poseEigToPoseStamped(keyframes_[i].pose_corrected_eig_));
+                time.fromSec(keyframes_snapshot[i].timestamp_);
+                bag.write("/keyframe_pcd", time, pclToPclRos(keyframes_snapshot[i].pcd_, map_frame_));
+                bag.write("/keyframe_pose", time, poseEigToPoseStamped(keyframes_snapshot[i].pose_corrected_eig_));
             }
+            bag.close();
+            ROS_INFO("\033[36;1mResult saved in .bag format!!!\033[0m");
         }
-        bag.close();
-        ROS_INFO("\033[36;1mResult saved in .bag format!!!\033[0m");
-    }
-    if (save_map_pcd_)
-    {
-        pcl::PointCloud<PointType>::Ptr corrected_map(new pcl::PointCloud<PointType>());
-        corrected_map->reserve(keyframes_[0].pcd_.size() * keyframes_.size()); // it's an approximated size
+
+        if (save_map_pcd_)
         {
-            std::lock_guard<std::mutex> lock(keyframes_mutex_);
-            for (size_t i = 0; i < keyframes_.size(); ++i)
+            pcl::PointCloud<PointType>::Ptr corrected_map(new pcl::PointCloud<PointType>());
+            corrected_map->reserve(keyframes_snapshot[0].pcd_.size() * keyframes_snapshot.size());
+            for (size_t i = 0; i < keyframes_snapshot.size(); ++i)
             {
-                *corrected_map += transformPcd(keyframes_[i].pcd_, keyframes_[i].pose_corrected_eig_);
+                *corrected_map += transformPcd(keyframes_snapshot[i].pcd_, keyframes_snapshot[i].pose_corrected_eig_);
+            }
+            const auto &voxelized_map = voxelizePcd(corrected_map, voxel_res_);
+            const auto map_to_save = capPointCount(voxelized_map);
+            if (map_to_save->size() < voxelized_map->size())
+            {
+                ROS_WARN("Capped map points before save: %zu -> %zu", voxelized_map->size(), map_to_save->size());
+            }
+            pcl::io::savePCDFileASCII<PointType>(package_path_ + "/result/result.pcd", *map_to_save);
+            ROS_INFO("\033[32;1mResult saved in .pcd format!!!\033[0m");
+        }
+    }
+    catch (const std::exception &e)
+    {
+        ROS_ERROR("Exception during shutdown save: %s", e.what());
+    }
+    catch (...)
+    {
+        ROS_ERROR("Unknown exception during shutdown save");
+    }
+
+    if (save_mapped_txt_)
+    {
+        try
+        {
+            std::ofstream mapped_txt_file(mapped_txt_path_, std::ios::out);
+            if (mapped_txt_file.is_open())
+            {
+                std::vector<const PosePcd *> poses_to_write;
+                poses_to_write.reserve(keyframes_snapshot.size());
+                for (const auto &kf : keyframes_snapshot)
+                {
+                    poses_to_write.push_back(&kf);
+                }
+
+                if (match_mapped_txt_baseline_length_ && !mapped_txt_baseline_path_.empty() && !poses_to_write.empty())
+                {
+                    std::ifstream baseline_file(mapped_txt_baseline_path_);
+                    size_t baseline_count = 0;
+                    std::string line;
+                    while (std::getline(baseline_file, line))
+                    {
+                        if (!line.empty() && line[0] != '#')
+                        {
+                            ++baseline_count;
+                        }
+                    }
+
+                    if (baseline_count == 0)
+                    {
+                        ROS_WARN("Baseline txt has no valid lines: %s. Writing full mapped txt.", mapped_txt_baseline_path_.c_str());
+                    }
+                    else if (baseline_count == poses_to_write.size())
+                    {
+                        ROS_INFO("Mapped txt already matches baseline length: %zu lines", baseline_count);
+                    }
+                    else
+                    {
+                        std::vector<const PosePcd *> sampled_poses;
+                        sampled_poses.reserve(baseline_count);
+                        if (baseline_count == 1)
+                        {
+                            sampled_poses.push_back(poses_to_write.front());
+                        }
+                        else
+                        {
+                            const double step = static_cast<double>(poses_to_write.size() - 1) / static_cast<double>(baseline_count - 1);
+                            for (size_t i = 0; i < baseline_count; ++i)
+                            {
+                                const size_t idx = static_cast<size_t>(std::round(i * step));
+                                sampled_poses.push_back(poses_to_write[idx]);
+                            }
+                        }
+                        poses_to_write.swap(sampled_poses);
+                        ROS_INFO("Resampled mapped.txt length to baseline: %zu -> %zu (baseline: %s)",
+                                 keyframes_snapshot.size(),
+                                 poses_to_write.size(),
+                                 mapped_txt_baseline_path_.c_str());
+                    }
+                }
+
+                mapped_txt_file.setf(std::ios::fixed, std::ios::floatfield);
+                mapped_txt_file.precision(10);
+                for (const auto *kf_ptr : poses_to_write)
+                {
+                    const auto &kf = *kf_ptr;
+                    Eigen::Quaterniond quat(kf.pose_corrected_eig_.block<3, 3>(0, 0));
+                    quat.normalize();
+                    mapped_txt_file << kf.timestamp_ << " "
+                                    << kf.pose_corrected_eig_(0, 3) << " "
+                                    << kf.pose_corrected_eig_(1, 3) << " "
+                                    << kf.pose_corrected_eig_(2, 3) << " "
+                                    << quat.x() << " "
+                                    << quat.y() << " "
+                                    << quat.z() << " "
+                                    << quat.w() << "\n";
+                }
+                ROS_INFO("\033[36;1mTUM mapped.txt saved: %s (%zu poses)\033[0m", mapped_txt_path_.c_str(), poses_to_write.size());
+            }
+            else
+            {
+                ROS_ERROR("Failed to open mapped.txt for write: %s", mapped_txt_path_.c_str());
             }
         }
-        const auto &voxelized_map = voxelizePcd(corrected_map, voxel_res_);
-        pcl::io::savePCDFileASCII<PointType>(package_path_ + "/result.pcd", *voxelized_map);
-        ROS_INFO("\033[32;1mResult saved in .pcd format!!!\033[0m");
+        catch (const std::exception &e)
+        {
+            ROS_ERROR("Exception saving mapped.txt: %s", e.what());
+        }
     }
+
+    shutdown_saved_ = true;
+}
+
+pcl::PointCloud<PointType>::Ptr FastLioSam::capPointCount(const pcl::PointCloud<PointType>::Ptr &cloud) const
+{
+    if (!cloud || save_max_points_ <= 0)
+    {
+        return cloud;
+    }
+
+    const size_t max_points = static_cast<size_t>(save_max_points_);
+    if (cloud->size() <= max_points)
+    {
+        return cloud;
+    }
+
+    pcl::PointCloud<PointType>::Ptr capped_cloud(new pcl::PointCloud<PointType>());
+    capped_cloud->points.reserve(max_points);
+
+    if (max_points == 1)
+    {
+        capped_cloud->points.push_back(cloud->points.front());
+    }
+    else
+    {
+        const double step = static_cast<double>(cloud->size() - 1) / static_cast<double>(max_points - 1);
+        for (size_t i = 0; i < max_points; ++i)
+        {
+            const size_t idx = static_cast<size_t>(std::round(i * step));
+            capped_cloud->points.push_back(cloud->points[idx]);
+        }
+    }
+
+    capped_cloud->width = static_cast<uint32_t>(capped_cloud->points.size());
+    capped_cloud->height = 1;
+    capped_cloud->is_dense = cloud->is_dense;
+    return capped_cloud;
+}
+
+FastLioSam::~FastLioSam()
+{
+    shutdownAndSave();
+}
+
+void FastLioSam::appendMappedTumPose(double timestamp, const Eigen::Matrix4d &pose_eig)
+{
+    std::ofstream mapped_txt_file(mapped_txt_path_, std::ios::app);
+    if (!mapped_txt_file.is_open())
+    {
+        ROS_ERROR("Failed to open mapped.txt for write: %s", mapped_txt_path_.c_str());
+        return;
+    }
+
+    Eigen::Quaterniond quat(pose_eig.block<3, 3>(0, 0));
+    quat.normalize();
+
+    mapped_txt_file.setf(std::ios::fixed, std::ios::floatfield);
+    mapped_txt_file.precision(10);
+    mapped_txt_file << timestamp << " "
+                    << pose_eig(0, 3) << " "
+                    << pose_eig(1, 3) << " "
+                    << pose_eig(2, 3) << " "
+                    << quat.x() << " "
+                    << quat.y() << " "
+                    << quat.z() << " "
+                    << quat.w() << std::endl;
 }
 
 void FastLioSam::updateOdomsAndPaths(const PosePcd &pose_pcd_in)

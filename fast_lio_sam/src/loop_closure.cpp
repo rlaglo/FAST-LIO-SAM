@@ -117,7 +117,7 @@ RegistrationOutput LoopClosure::performLoopClosure(const PosePcd &query_keyframe
         *dst_cloud_ = dst_cloud;
 
         std::cout << "\033[1;35mExecute GICP: " << src_cloud.size() << " vs " << dst_cloud.size() << "\033[0m\n";
-        return icpAlignment(src_cloud, dst_cloud);
+        return icpAlignment(src_cloud, dst_cloud); // 이 점수가 loop factor variance에 들어감
     }
     else
     {
