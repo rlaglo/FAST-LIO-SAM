@@ -89,6 +89,7 @@ private:
     nav_msgs::Path odom_path_, corrected_path_;
     bool global_map_vis_switch_ = true;
     ///// results
+    std::string output_dir_;
     bool save_map_bag_ = false, save_map_pcd_ = false, save_in_kitti_format_ = false;
     bool save_mapped_txt_ = true;
     bool match_mapped_txt_baseline_length_ = false;

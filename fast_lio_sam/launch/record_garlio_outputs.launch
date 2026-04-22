@@ -1,0 +1,10 @@
+<launch>
+  <arg name="output_bag" default="/root/dataset/garlio-stage-rosbag/garlio_outputs.bag" />
+  <arg name="extra_topics" default="" />
+
+  <node pkg="rosbag"
+        type="record"
+        name="record_garlio_outputs"
+        output="screen"
+        args="-O $(arg output_bag) /aft_mapped_to_init /laser_cloud_registered /aft_mapped_path $(arg extra_topics)" />
+</launch>

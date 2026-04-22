@@ -31,6 +31,11 @@ FastLioSam::FastLioSam(const ros::NodeHandle &n_private):
     nh_.param<bool>("/result/auto_save_on_idle", auto_save_on_idle_, true);
     nh_.param<double>("/result/bag_end_timeout_sec", bag_end_timeout_sec_, 30.0);
     nh_.param<std::string>("/result/seq_name", seq_name_, "");
+    nh_.param<std::string>("/result/output_dir", output_dir_, std::string(""));
+    if (output_dir_.empty())
+    {
+        output_dir_ = package_path_ + "/result";
+    }
     /* Loop closure */
     loop_closure_.reset(new LoopClosure(lc_config));
     /* Initialization of GTSAM */
@@ -469,7 +474,7 @@ void FastLioSam::shutdownAndSave()
         return;
     }
 
-    ROS_WARN("shutdownAndSave called. save_map_bag=%d, save_map_pcd=%d", save_map_bag_, save_map_pcd_);
+    ROS_WARN("shutdownAndSave called. save_map_bag=%d, save_map_pcd=%d, save_in_kitti=%d", save_map_bag_, save_map_pcd_, save_in_kitti_format_);
 
     // Stop incoming callbacks before taking a snapshot for save.
     loop_timer_.stop();

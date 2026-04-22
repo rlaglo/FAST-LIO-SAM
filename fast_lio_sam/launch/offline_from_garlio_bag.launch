@@ -1,0 +1,42 @@
+<launch>
+  <arg name="input_bag" default="/root/dataset/garlio_outputs_sl.bag" />
+  <arg name="output_dir" default="$(find fast_lio_sam)/result" />
+  <arg name="seq_name" default="sequence" />
+  <arg name="bag_rate" default="2.0" />
+  <arg name="bag_end_timeout_sec" default="30.0" />
+  <arg name="rviz" default="true" />
+
+  <rosparam command="load" file="$(find fast_lio_sam)/config/config.yaml" />
+  <param name="/result/output_dir" type="string" value="$(arg output_dir)" />
+  <param name="/result/seq_name" type="string" value="$(arg seq_name)" />
+  <param name="/result/bag_end_timeout_sec" type="double" value="$(arg bag_end_timeout_sec)" />
+  <param name="/result/mapped_txt_path" type="string" value="$(eval arg('output_dir') + '/' + arg('seq_name') + '/mapped.txt')" />
+  <param name="/result/save_map_pcd" type="bool" value="true" />
+  <param name="/result/save_map_bag" type="bool" value="true" />
+
+  <node if="$(arg rviz)"
+        pkg="rviz"
+        type="rviz"
+        name="rviz_sam"
+        args="-d $(find fast_lio_sam)/config/sam_rviz.rviz"
+        launch-prefix="nice" />
+
+  <node pkg="fast_lio_sam" type="fast_lio_sam_node" name="fast_lio_sam_node" output="screen">
+    <env name="LD_LIBRARY_PATH" value="/usr/local/lib:$(optenv LD_LIBRARY_PATH)"/>
+    <remap from="/Odometry" to="/aft_mapped_to_init"/>
+    <remap from="/cloud_registered" to="/laser_cloud_registered"/>
+  </node>
+
+<!-- roslaunch fast_lio_sam offline_from_garlio_bag.launch \
+    input_bag:=/root/dataset/garlio_outputs_sl.bag \
+    output_dir:=/root/dataset/ba-stage/sl \
+    seq_name:=sequence \
+    bag_rate:=2.5 \
+    rviz:=true -->
+
+  <node pkg="rosbag"
+        type="play"
+        name="play_garlio_output_bag"
+        output="screen"
+        args="--clock -r $(arg bag_rate) $(arg input_bag)" />
+</launch>
